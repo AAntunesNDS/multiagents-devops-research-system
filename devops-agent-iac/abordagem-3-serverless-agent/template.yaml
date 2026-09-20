@@ -1,0 +1,455 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Agente DevOps serverless - cerebro efemero que provisiona a camada de
+  infraestrutura base (VPC, KMS, IAM, SGs) via Lambda + Step Functions + EventBridge.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: agentes-devops
+  EnvironmentName:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, hml, prod]
+  AlertEmail:
+    Type: String
+    Description: E-mail que recebe alertas de falha do agente
+  DriftScheduleExpression:
+    Type: String
+    Default: rate(1 day)
+
+Globals:
+  Function:
+    Runtime: python3.11
+    MemorySize: 512
+    Timeout: 300
+    Architectures: [arm64]          # ~20% mais barato que x86_64
+    Tracing: Active
+    CodeUri: src/
+    Environment:
+      Variables:
+        PROJECT_NAME: !Ref ProjectName
+        REGISTRY_TABLE: !Ref ResourceRegistry
+        EVENT_BUS: !Ref AgentEventBus
+        SPEC_PARAMETER: !Sub '/${ProjectName}/spec/base-infra'
+        LOG_LEVEL: INFO
+        POWERTOOLS_SERVICE_NAME: devops-agent
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # Estado: substitui o state file. Item por recurso, PITR ligado, SSE com CMK.
+  # ---------------------------------------------------------------------------
+  RegistryKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: CMK do registro de recursos do agente
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root' }
+            Action: 'kms:*'
+            Resource: '*'
+
+  ResourceRegistry:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      TableName: !Sub '${ProjectName}-agent-registry'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: pk, AttributeType: S }
+        - { AttributeName: env, AttributeType: S }
+        - { AttributeName: logical_id, AttributeType: S }
+      KeySchema:
+        - { AttributeName: pk, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: by-env
+          KeySchema:
+            - { AttributeName: env, KeyType: HASH }
+            - { AttributeName: logical_id, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+      PointInTimeRecoverySpecification: { PointInTimeRecoveryEnabled: true }
+      SSESpecification:
+        SSEEnabled: true
+        SSEType: KMS
+        KMSMasterKeyId: !Ref RegistryKey
+
+  # ---------------------------------------------------------------------------
+  # Eventos e alertas
+  # ---------------------------------------------------------------------------
+  AgentEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub '${ProjectName}-agent-bus'
+
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${ProjectName}-agent-alerts'
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+
+  DeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${ProjectName}-agent-dlq'
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Spec desejada (equivalente ao .tfvars). Versionada no repositorio e
+  # publicada no SSM pelo pipeline.
+  # ---------------------------------------------------------------------------
+  BaseInfraSpec:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/spec/base-infra/${EnvironmentName}'
+      Type: String
+      Value: !Sub |
+        {
+          "vpc_cidr": "10.23.0.0/16",
+          "az_count": 2,
+          "single_nat_gateway": true,
+          "environment": "${EnvironmentName}"
+        }
+
+  # ---------------------------------------------------------------------------
+  # Funcoes do agente
+  # ---------------------------------------------------------------------------
+  PlannerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-planner'
+      Handler: handlers/planner.handler
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ResourceRegistry }
+        - SSMParameterReadPolicy: { ParameterName: !Sub '${ProjectName}/spec/base-infra/*' }
+
+  EncryptionFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-encryption'
+      Handler: handlers/encryption.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - kms:CreateKey
+                - kms:TagResource
+                - kms:EnableKeyRotation
+                - kms:PutKeyPolicy
+                - kms:DescribeKey
+              Resource: '*'   # CreateKey nao aceita ARN de recurso
+            - Effect: Allow
+              Action: [kms:CreateAlias, kms:DeleteAlias]
+              Resource:
+                - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:alias/${EnvironmentName}-*'
+                - !Sub 'arn:aws:kms:${AWS::Region}:${AWS::AccountId}:key/*'
+            - Effect: Allow
+              Action: sts:GetCallerIdentity
+              Resource: '*'
+
+  NetworkFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-network'
+      Timeout: 600
+      Handler: handlers/network.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateVpc
+                - ec2:ModifyVpcAttribute
+                - ec2:CreateSubnet
+                - ec2:CreateInternetGateway
+                - ec2:AttachInternetGateway
+                - ec2:CreateNatGateway
+                - ec2:AllocateAddress
+                - ec2:CreateTags
+                - ec2:Describe*
+              Resource: '*'   # APIs de criacao do EC2 nao suportam ARN
+              Condition:
+                StringEquals:
+                  aws:RequestedRegion: !Ref AWS::Region
+
+  NatPollerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-nat-poller'
+      Timeout: 30
+      MemorySize: 256
+      Handler: handlers/nat_poller.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: ec2:DescribeNatGateways
+              Resource: '*'
+
+  RoutingFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-routing'
+      Handler: handlers/routing.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateRouteTable
+                - ec2:CreateRoute
+                - ec2:AssociateRouteTable
+                - ec2:CreateVpcEndpoint
+                - ec2:CreateTags
+                - ec2:Describe*
+              Resource: '*'
+
+  SecurityGroupsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-security-groups'
+      Handler: handlers/security_groups.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:CreateSecurityGroup
+                - ec2:AuthorizeSecurityGroupIngress
+                - ec2:AuthorizeSecurityGroupEgress
+                - ec2:RevokeSecurityGroupEgress
+                - ec2:CreateTags
+                - ec2:Describe*
+              Resource: '*'
+
+  IdentityFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-identity'
+      Handler: handlers/identity.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            # Escopo de IAM restrito ao prefixo do ambiente: a funcao nao pode
+            # criar roles arbitrarias na conta.
+            - Effect: Allow
+              Action: [iam:CreateRole, iam:PutRolePolicy, iam:TagRole, iam:GetRole, iam:DeleteRole, iam:DeleteRolePolicy, iam:ListRolePolicies]
+              Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-role-*'
+            - Effect: Allow
+              Action: sts:GetCallerIdentity
+              Resource: '*'
+      PermissionsBoundary: !Ref AgentPermissionsBoundary
+
+  ContractFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-contract'
+      Handler: handlers/contract.handler
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [ssm:PutParameter, ssm:AddTagsToResource]
+              Resource: !Sub 'arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ProjectName}/*'
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt AgentEventBus.Arn
+
+  RollbackFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-rollback'
+      Handler: handlers/rollback.handler
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ResourceRegistry }
+
+  DestroyFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-destroy'
+      Timeout: 900
+      Handler: handlers/destroy.handler
+      DeadLetterQueue:
+        Type: SQS
+        TargetArn: !GetAtt DeadLetterQueue.Arn
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref ResourceRegistry }
+        - SQSSendMessagePolicy: { QueueName: !GetAtt DeadLetterQueue.QueueName }
+        - Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DeleteVpc
+                - ec2:DeleteSubnet
+                - ec2:DeleteRouteTable
+                - ec2:DeleteNatGateway
+                - ec2:DeleteInternetGateway
+                - ec2:DetachInternetGateway
+                - ec2:DeleteSecurityGroup
+                - ec2:DeleteVpcEndpoints
+                - ec2:ReleaseAddress
+                - ec2:Describe*
+              Resource: '*'
+            - Effect: Allow
+              Action: [iam:DeleteRole, iam:DeleteRolePolicy, iam:ListRolePolicies]
+              Resource: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${EnvironmentName}-role-*'
+            - Effect: Allow
+              Action: kms:ScheduleKeyDeletion
+              Resource: '*'
+
+  DriftFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-agent-drift'
+      Handler: handlers/drift.handler
+      Environment:
+        Variables:
+          DEFAULT_ENV: !Ref EnvironmentName
+      Policies:
+        - DynamoDBReadPolicy: { TableName: !Ref ResourceRegistry }
+        - Statement:
+            - Effect: Allow
+              Action: [ec2:Describe*, iam:GetRole]
+              Resource: '*'
+            - Effect: Allow
+              Action: events:PutEvents
+              Resource: !GetAtt AgentEventBus.Arn
+      Events:
+        Schedule:
+          Type: ScheduleV2
+          Properties:
+            ScheduleExpression: !Ref DriftScheduleExpression
+            Input: !Sub '{"environment": "${EnvironmentName}"}'
+
+  # Boundary que limita o que as roles criadas pelo agente podem fazer.
+  # Nao existe equivalente automatico nas Abordagens 1 e 2.
+  AgentPermissionsBoundary:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub '${ProjectName}-agent-boundary'
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action: '*'
+            Resource: '*'
+          - Effect: Deny
+            Action:
+              - iam:CreateUser
+              - iam:CreateAccessKey
+              - organizations:*
+              - account:*
+            Resource: '*'
+
+  # ---------------------------------------------------------------------------
+  # Orquestracao
+  # ---------------------------------------------------------------------------
+  ProvisioningStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${ProjectName}-provisioning'
+      Type: STANDARD
+      DefinitionUri: statemachine/provisioning.asl.json
+      DefinitionSubstitutions:
+        PlannerFunctionArn: !GetAtt PlannerFunction.Arn
+        EncryptionFunctionArn: !GetAtt EncryptionFunction.Arn
+        NetworkFunctionArn: !GetAtt NetworkFunction.Arn
+        NatPollerFunctionArn: !GetAtt NatPollerFunction.Arn
+        RoutingFunctionArn: !GetAtt RoutingFunction.Arn
+        SecurityGroupsFunctionArn: !GetAtt SecurityGroupsFunction.Arn
+        IdentityFunctionArn: !GetAtt IdentityFunction.Arn
+        ContractFunctionArn: !GetAtt ContractFunction.Arn
+        RollbackFunctionArn: !GetAtt RollbackFunction.Arn
+        AlertTopicArn: !Ref AlertTopic
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref PlannerFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref EncryptionFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref NetworkFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref NatPollerFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref RoutingFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref SecurityGroupsFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref IdentityFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref ContractFunction }
+        - LambdaInvokePolicy: { FunctionName: !Ref RollbackFunction }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt AlertTopic.TopicName }
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt ProvisioningLogGroup.Arn
+      Tracing: { Enabled: true }
+      Events:
+        ProvisionRequested:
+          Type: EventBridgeRule
+          Properties:
+            EventBusName: !Ref AgentEventBus
+            Pattern:
+              source: [devops.agent]
+              detail-type: ['base-infra.provision-requested']
+
+  DecommissionStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: !Sub '${ProjectName}-decommission'
+      Type: STANDARD
+      DefinitionUri: statemachine/decommission.asl.json
+      DefinitionSubstitutions:
+        DestroyFunctionArn: !GetAtt DestroyFunction.Arn
+        AlertTopicArn: !Ref AlertTopic
+      Policies:
+        - LambdaInvokePolicy: { FunctionName: !Ref DestroyFunction }
+        - SNSPublishMessagePolicy: { TopicName: !GetAtt AlertTopic.TopicName }
+      Logging:
+        Level: ALL
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt DecommissionLogGroup.Arn
+
+  ProvisioningLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-provisioning'
+      RetentionInDays: 30
+
+  DecommissionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/vendedlogs/states/${ProjectName}-decommission'
+      RetentionInDays: 30
+
+  # Alarme sobre falhas de execucao (observabilidade minima do agente)
+  ProvisioningFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${ProjectName}-provisioning-failures'
+      Namespace: AWS/States
+      MetricName: ExecutionsFailed
+      Dimensions:
+        - Name: StateMachineArn
+          Value: !Ref ProvisioningStateMachine
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions: [!Ref AlertTopic]
+
+Outputs:
+  ProvisioningStateMachineArn:
+    Value: !Ref ProvisioningStateMachine
+  DecommissionStateMachineArn:
+    Value: !Ref DecommissionStateMachine
+  EventBusName:
+    Value: !Ref AgentEventBus
+  RegistryTable:
+    Value: !Ref ResourceRegistry
+  ContractParameter:
+    Value: !Sub '/${ProjectName}/${EnvironmentName}/base-infra-serverless'

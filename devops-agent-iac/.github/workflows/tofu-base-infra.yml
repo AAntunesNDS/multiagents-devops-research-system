@@ -1,0 +1,430 @@
+# Esteira da Abordagem 1 — OpenTofu (HCL).
+#
+# Estagios: qualidade -> plan -> apply (com aprovacao) -> destroy (dupla confirmacao).
+# Autenticacao exclusivamente por OIDC; nenhuma access key estatica no repositorio.
+#
+# Secrets esperados:
+#   AWS_DEPLOY_ROLE_ARN  role criada por modules/iam (<prefix>-gha-deploy)
+#   TF_STATE_BUCKET      output state_bucket do bootstrap/
+#   TF_LOCK_TABLE        output lock_table do bootstrap/
+#   INFRACOST_API_KEY    opcional; sem ele o job de custo e pulado
+#
+# Environments esperados (configure required reviewers em cada um):
+#   dev, prod, dev-destroy, prod-destroy
+name: tofu-base-infra
+
+on:
+  pull_request:
+    paths:
+      - 'abordagem-1-opentofu/**'
+      - '.github/workflows/tofu-base-infra.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'abordagem-1-opentofu/**'
+      - '.github/workflows/tofu-base-infra.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente alvo
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: Acao a executar
+        type: choice
+        options: [plan, apply, destroy]
+        default: plan
+      confirm:
+        description: 'Apenas para destroy: digite DESTROY-<ambiente>'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# Nunca dois applies concorrentes no mesmo ambiente: o lock do DynamoDB
+# resolveria, mas falhando o job em vez de enfileirar.
+concurrency:
+  group: tofu-base-infra-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  TOFU_VERSION: 1.8.5
+  TFLINT_VERSION: v0.52.0
+  CHECKOV_VERSION: 3.2.200
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  PROJECT_DIR: abordagem-1-opentofu
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 1. Qualidade — sem credencial AWS: nada aqui precisa tocar a conta. #
+  # ------------------------------------------------------------------ #
+  static-analysis:
+    name: Qualidade (fmt, validate, TFLint, Checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: tofu fmt
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: tofu fmt -check -recursive
+
+      - name: tofu validate (modulos, ambiente e bootstrap)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          for dir in modules/*/ envs/${ENVIRONMENT}/ bootstrap/; do
+            echo "::group::validate ${dir}"
+            tofu -chdir="${dir}" init -backend=false -input=false
+            tofu -chdir="${dir}" validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: TFLint
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: tflint --recursive --minimum-failure-severity=error
+
+      - name: Checkov (framework terraform)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          pip install --quiet "checkov==${CHECKOV_VERSION}"
+          checkov -d . --framework terraform --compact \
+            --output cli --output sarif --output-file-path console,.
+
+      # Falha sem Advanced Security em repositorio privado — nao bloqueia a esteira.
+      - name: Publica SARIF do Checkov
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.PROJECT_DIR }}/results.sarif
+          category: checkov-opentofu
+
+  # ------------------------------------------------------------------ #
+  # 2. Plan — o artefato binario aprovado aqui e o que sera aplicado.   #
+  # ------------------------------------------------------------------ #
+  plan:
+    name: Plan (${{ github.event.inputs.environment || 'dev' }})
+    needs: static-analysis
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    env:
+      INFRACOST_API_KEY: ${{ secrets.INFRACOST_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tofu-plan-${{ github.run_id }}
+
+      - name: Identidade efetiva
+        run: aws sts get-caller-identity
+
+      - name: tofu init (backend parcial)
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          tofu init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: tofu plan
+        id: plan
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          tofu plan -input=false -lock-timeout=5m -no-color -out=tfplan
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+          tofu show -json    tfplan > tfplan.json
+          tofu show -no-color tfplan > tfplan.txt
+
+          changes=$(jq '[.resource_changes[]
+            | select(.change.actions != ["no-op"])] | length' tfplan.json)
+          echo "changes=${changes}" >> "$GITHUB_OUTPUT"
+
+      # Guarda de custo: os numeros vem do RUNBOOK 3.3 ("o que observar no plan").
+      # Em dev, mais de 1 NAT ou qualquer interface endpoint significa que a
+      # flag de custo nao foi lida — 💸 evitavel.
+      - name: Guarda de custo
+        id: cost_guard
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          count() {
+            jq --arg t "$1" '[.resource_changes[]
+              | select(.type == $t and (.change.actions | index("create")))] | length' tfplan.json
+          }
+          nat=$(count aws_nat_gateway)
+          eps=$(count aws_vpc_endpoint)
+          cmk=$(count aws_kms_key)
+          {
+            echo "nat=${nat}"
+            echo "endpoints=${eps}"
+            echo "cmk=${cmk}"
+          } >> "$GITHUB_OUTPUT"
+
+          if [[ "${ENVIRONMENT}" == "dev" && "${nat}" -gt 1 ]]; then
+            echo "::error::dev com ${nat} NAT Gateways (~US\$ 33/mes cada). Confira single_nat_gateway."
+            exit 1
+          fi
+
+      - name: Infracost
+        id: infracost
+        if: env.INFRACOST_API_KEY != ''
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          curl -fsSL https://raw.githubusercontent.com/infracost/infracost/master/scripts/install.sh | sh -s -- -b /usr/local/bin
+          infracost breakdown --path tfplan.json --format table | tee infracost.txt
+
+      # O plano binario e o artefato de governanca desta abordagem: e ele que o
+      # job de apply consome, nao um recalculo. Retencao curta porque o plano
+      # pode conter valores de atributos sensiveis.
+      - name: Guarda o plano aprovado
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.sha }}
+          path: |
+            ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}/tfplan
+            ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}/tfplan.json
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Job summary
+        run: |
+          {
+            echo "## OpenTofu — plan (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de plan | ${{ steps.plan.outputs.seconds }}s |"
+            echo "| Recursos alterados | ${{ steps.plan.outputs.changes }} |"
+            echo "| NAT Gateways a criar | ${{ steps.cost_guard.outputs.nat }} |"
+            echo "| VPC Endpoints a criar | ${{ steps.cost_guard.outputs.endpoints }} |"
+            echo "| CMKs a criar | ${{ steps.cost_guard.outputs.cmk }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comenta o plano no PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_SECONDS: ${{ steps.plan.outputs.seconds }}
+          PLAN_CHANGES: ${{ steps.plan.outputs.changes }}
+          NAT_COUNT: ${{ steps.cost_guard.outputs.nat }}
+          CMK_COUNT: ${{ steps.cost_guard.outputs.cmk }}
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = `${process.env.PROJECT_DIR}/envs/${process.env.ENVIRONMENT}`;
+            const read = (f, limit) => {
+              try { return fs.readFileSync(`${dir}/${f}`, 'utf8').slice(0, limit); }
+              catch { return null; }
+            };
+            const plan = read('tfplan.txt', 55000) ?? '(plano indisponivel)';
+            const cost = read('infracost.txt', 5000);
+            const marker = '<!-- tofu-base-infra-plan -->';
+
+            let body = `${marker}\n### OpenTofu — plan \`${process.env.ENVIRONMENT}\`\n\n`;
+            body += `| Metrica | Valor |\n|---|---|\n`;
+            body += `| Tempo de plan | ${process.env.PLAN_SECONDS}s |\n`;
+            body += `| Recursos alterados | ${process.env.PLAN_CHANGES} |\n`;
+            body += `| NAT Gateways / CMKs a criar | ${process.env.NAT_COUNT} / ${process.env.CMK_COUNT} 💸 |\n\n`;
+            if (cost) body += `<details><summary>Infracost</summary>\n\n\`\`\`\n${cost}\n\`\`\`\n</details>\n\n`;
+            body += `<details><summary>Plano completo</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n</details>`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = (await github.rest.issues.listComments({ owner, repo, issue_number }))
+              .data.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  # ------------------------------------------------------------------ #
+  # 3. Apply 💸 — aplica exatamente o plano revisado, sob aprovacao.    #
+  # ------------------------------------------------------------------ #
+  apply:
+    name: Apply 💸 (${{ github.event.inputs.environment || 'dev' }})
+    needs: plan
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'apply')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tofu-apply-${{ github.run_id }}
+
+      - name: Recupera o plano aprovado
+        uses: actions/download-artifact@v4
+        with:
+          name: tfplan-${{ env.ENVIRONMENT }}-${{ github.sha }}
+          path: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+
+      - name: tofu init (backend parcial)
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          tofu init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: tofu apply tfplan
+        id: apply
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          tofu apply -input=false -lock-timeout=5m -no-color tfplan
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Verifica o contrato publicado
+        id: contract
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          aws ssm get-parameter --name "/agentes-devops/${ENVIRONMENT}/base-infra" \
+            --query Parameter.Value --output text | jq . > contract.json
+          echo "keys=$(jq 'keys | length' contract.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## OpenTofu — apply (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de apply | ${{ steps.apply.outputs.seconds }}s |"
+            echo "| Chaves no contrato SSM | ${{ steps.contract.outputs.keys }} |"
+            echo ""
+            echo "Contrato: \`/agentes-devops/${ENVIRONMENT}/base-infra\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  # 4. Destroy — tres barreiras: acao no dispatch, string de confirmacao #
+  #    e aprovacao no Environment <ambiente>-destroy. Prod e bloqueado.  #
+  # ------------------------------------------------------------------ #
+  destroy:
+    name: Destroy (${{ github.event.inputs.environment }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}-destroy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Bloqueio de producao
+        if: github.event.inputs.environment == 'prod'
+        run: |
+          echo "::error::Destroy de producao e bloqueado por codigo nesta esteira."
+          exit 1
+
+      # A confirmacao vai por env, nunca interpolada direto no shell.
+      - name: Confirmacao textual
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [[ "${CONFIRM}" != "DESTROY-${ENVIRONMENT}" ]]; then
+            echo "::error::Confirmacao invalida. Esperado: DESTROY-${ENVIRONMENT}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ env.TOFU_VERSION }}
+          tofu_wrapper: false
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-tofu-destroy-${{ github.run_id }}
+
+      - name: tofu init (backend parcial)
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          tofu init -input=false \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="dynamodb_table=${{ secrets.TF_LOCK_TABLE }}" \
+            -backend-config="region=${AWS_REGION}"
+
+      - name: tofu destroy
+        id: destroy
+        working-directory: ${{ env.PROJECT_DIR }}/envs/${{ env.ENVIRONMENT }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          tofu destroy -auto-approve -input=false -lock-timeout=5m -no-color
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      # NAT Gateway e EIP nao associado continuam cobrando apos destroy
+      # incompleto — RUNBOOK etapa 6.
+      - name: Conferencia de residuos
+        run: |
+          {
+            echo "## OpenTofu — destroy (${ENVIRONMENT})"
+            echo ""
+            echo "Tempo: ${{ steps.destroy.outputs.seconds }}s"
+            echo ""
+            echo '### NAT Gateways ativos'
+            echo '```'
+            aws ec2 describe-nat-gateways \
+              --query 'NatGateways[?State==`available`].[NatGatewayId,VpcId]' --output text
+            echo '```'
+            echo '### EIPs sem associacao'
+            echo '```'
+            aws ec2 describe-addresses \
+              --query 'Addresses[?AssociationId==null].[AllocationId,PublicIp]' --output text
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

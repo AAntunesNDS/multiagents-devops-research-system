@@ -1,0 +1,12 @@
+{
+  "// comentario": "Copie para .claude/settings.local.json (gitignored). Sobrescreve settings.json apenas para voce.",
+  "permissions": {
+    "allow": [
+      "Bash(aws sso login*)"
+    ]
+  },
+  "env": {
+    "AWS_PROFILE": "lab-devops",
+    "AWS_REGION": "us-east-1"
+  }
+}

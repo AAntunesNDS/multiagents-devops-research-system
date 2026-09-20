@@ -1,0 +1,435 @@
+# Esteira da Abordagem 3 — Agente DevOps Serverless (SAM + Step Functions).
+#
+# Cinco jobs, refletindo a separacao que so existe nesta abordagem:
+#   quality      lint, testes, validacao das ASL, sam validate, cfn-lint, Checkov
+#   deploy-agent publica o AGENTE (Lambdas, state machines, registry) — nao a infra
+#   plan         executa a state machine em dry_run e comenta o plano no PR
+#   provision    publica o evento no EventBridge e acompanha a execucao 💸
+#   destroy      dispara a state machine de decommission com dupla confirmacao
+#
+# Secrets esperados:
+#   AWS_AGENT_DEPLOY_ROLE_ARN  deploy do agente (CloudFormation/SAM)
+#   AWS_AGENT_INVOKE_ROLE_ARN  apenas events:PutEvents, states:StartExecution,
+#                              states:DescribeExecution e as leituras de
+#                              states:ListStateMachines/ListExecutions usadas
+#                              para descobrir o ARN. O runner NUNCA recebe
+#                              permissao de criar VPC, KMS ou IAM — essas
+#                              permissoes vivem nas roles das Lambdas.
+#
+# Environments esperados (configure required reviewers em cada um):
+#   dev, prod, dev-provision, prod-provision, dev-destroy, prod-destroy
+name: serverless-agent
+
+on:
+  pull_request:
+    paths:
+      - 'abordagem-3-serverless-agent/**'
+      - '.github/workflows/serverless-agent.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'abordagem-3-serverless-agent/**'
+      - '.github/workflows/serverless-agent.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente alvo
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: Acao a executar
+        type: choice
+        options: [plan, deploy-agent, provision, destroy]
+        default: plan
+      confirm:
+        description: 'Apenas para destroy: digite DESTROY-<ambiente>'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+# O registry usa claim() com escrita condicional: duas execucoes simultaneas
+# falham por design ("Execucao concorrente detectada"). Serializa aqui.
+concurrency:
+  group: serverless-agent-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.11'
+  CHECKOV_VERSION: 3.2.200
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  PROJECT_NAME: agentes-devops
+  PROJECT_DIR: abordagem-3-serverless-agent
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 1. Qualidade — sem credencial AWS. Os testes usam moto.             #
+  # ------------------------------------------------------------------ #
+  quality:
+    name: Qualidade (ruff, pytest, ASL, sam validate, cfn-lint, Checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/requirements-dev.txt
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Instala dependencias
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: pip install --quiet -r requirements-dev.txt
+
+      - name: ruff
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ruff check src tests
+
+      - name: pytest (idempotencia do registry, ordem do destroy)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: PYTHONPATH=src pytest -v
+
+      - name: Valida as definicoes ASL
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          for asl in statemachine/*.asl.json; do
+            jq empty "$asl"
+            jq -e '.StartAt and .States' "$asl" > /dev/null
+            echo "ok: $asl"
+          done
+
+      - name: sam validate --lint
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: sam validate --lint --region "${AWS_REGION}"
+
+      - name: cfn-lint
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: cfn-lint template.yaml
+
+      - name: Checkov (template SAM)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          checkov -f template.yaml --framework cloudformation --compact \
+            --output cli --output sarif --output-file-path console,.
+
+      # Falha sem Advanced Security em repositorio privado — nao bloqueia a esteira.
+      - name: Publica SARIF do Checkov
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.PROJECT_DIR }}/results.sarif
+          category: checkov-serverless-agent
+
+  # ------------------------------------------------------------------ #
+  # 2. Deploy do AGENTE 💸 (~US$ 0,60/mes ocioso).                      #
+  #    Nao cria rede, CMK de workload nem IAM de workload.              #
+  # ------------------------------------------------------------------ #
+  deploy-agent:
+    name: Deploy do agente 💸 (${{ github.event.inputs.environment || 'dev' }})
+    needs: quality
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy-agent')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_AGENT_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-agent-deploy-${{ github.run_id }}
+
+      - name: sam build
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: sam build
+
+      - name: sam deploy
+        id: deploy
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          sam deploy --config-env "${ENVIRONMENT}" \
+            --no-confirm-changeset \
+            --no-fail-on-empty-changeset
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          {
+            echo "## Agente serverless — deploy do agente (${ENVIRONMENT})"
+            echo ""
+            echo "Tempo: ${{ steps.deploy.outputs.seconds }}s"
+            echo ""
+            echo "Nenhuma infraestrutura de rede foi criada — isso e o job \`provision\`."
+            echo ""
+            echo '```'
+            aws cloudformation describe-stacks \
+              --stack-name "${PROJECT_NAME}-serverless-agent-${ENVIRONMENT}" \
+              --query 'Stacks[0].Outputs[].[OutputKey,OutputValue]' --output text
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  # 3. Plan (dry_run) — nao cria nada.                                  #
+  #    Observacao metodologica: o dry-run exercita o agente JA IMPLANTADO #
+  #    no ambiente, nao o codigo do PR. E uma consequencia direta de     #
+  #    separar "implantar o agente" de "executar o agente".              #
+  # ------------------------------------------------------------------ #
+  plan:
+    name: Plan / dry-run (${{ github.event.inputs.environment || 'dev' }})
+    needs: quality
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'plan')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciais via OIDC (role sem permissao de criar recursos)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_AGENT_INVOKE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-agent-plan-${{ github.run_id }}
+
+      - name: Executa o dry-run
+        id: dryrun
+        run: |
+          set -euo pipefail
+          sm=$(aws stepfunctions list-state-machines \
+            --query "stateMachines[?name=='${PROJECT_NAME}-provisioning'].stateMachineArn | [0]" \
+            --output text)
+          if [[ -z "${sm}" || "${sm}" == "None" ]]; then
+            echo "::error::State machine ${PROJECT_NAME}-provisioning nao encontrada. Rode o job deploy-agent antes."
+            exit 1
+          fi
+
+          start=$(date +%s)
+          exec_arn=$(aws stepfunctions start-execution --state-machine-arn "${sm}" \
+            --input "$(jq -nc --arg env "${ENVIRONMENT}" '{environment:$env, dry_run:true}')" \
+            --query executionArn --output text)
+
+          while true; do
+            status=$(aws stepfunctions describe-execution --execution-arn "${exec_arn}" \
+              --query status --output text)
+            [[ "${status}" == "RUNNING" ]] || break
+            sleep 5
+          done
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+
+          aws stepfunctions describe-execution --execution-arn "${exec_arn}" \
+            --query output --output text > plan-output.json
+          jq -r '.summary | "create=\(.create)\nnoop=\(.noop)\ndrift=\(.drift)"' plan-output.json \
+            >> "$GITHUB_OUTPUT"
+
+          [[ "${status}" == "SUCCEEDED" ]]
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Agente serverless — dry-run (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de dry-run | ${{ steps.dryrun.outputs.seconds }}s |"
+            echo "| Status | ${{ steps.dryrun.outputs.status }} |"
+            echo "| CREATE / NOOP / DRIFT | ${{ steps.dryrun.outputs.create }} / ${{ steps.dryrun.outputs.noop }} / ${{ steps.dryrun.outputs.drift }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comenta o plano no PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          PLAN_SECONDS: ${{ steps.dryrun.outputs.seconds }}
+          PLAN_STATUS: ${{ steps.dryrun.outputs.status }}
+          PLAN_CREATE: ${{ steps.dryrun.outputs.create }}
+          PLAN_NOOP: ${{ steps.dryrun.outputs.noop }}
+          PLAN_DRIFT: ${{ steps.dryrun.outputs.drift }}
+        with:
+          script: |
+            const fs = require('fs');
+            let detail = '(saida indisponivel)';
+            try {
+              const raw = JSON.parse(fs.readFileSync('plan-output.json', 'utf8'));
+              detail = JSON.stringify(raw.plan ?? raw, null, 2).slice(0, 55000);
+            } catch {}
+            const marker = '<!-- serverless-agent-plan -->';
+
+            let body = `${marker}\n### Agente serverless — dry-run \`${process.env.ENVIRONMENT}\`\n\n`;
+            body += `| Metrica | Valor |\n|---|---|\n`;
+            body += `| Tempo de dry-run | ${process.env.PLAN_SECONDS}s |\n`;
+            body += `| Status da execucao | ${process.env.PLAN_STATUS} |\n`;
+            body += `| CREATE / NOOP / DRIFT | ${process.env.PLAN_CREATE} / ${process.env.PLAN_NOOP} / ${process.env.PLAN_DRIFT} |\n\n`;
+            body += `> O planner compara hash de spec contra o registry, nao o estado real na AWS — `;
+            body += `e deliberadamente mais fraco que \`tofu plan\`. A execucao acima usa o agente ja `;
+            body += `implantado no ambiente, nao o codigo deste PR.\n\n`;
+            body += `<details><summary>Plano por recurso</summary>\n\n\`\`\`json\n${detail}\n\`\`\`\n</details>`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = (await github.rest.issues.listComments({ owner, repo, issue_number }))
+              .data.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  # ------------------------------------------------------------------ #
+  # 4. Provisionamento real 💸 (VPC + NAT + CMKs ≈ US$ 36/mes).         #
+  #    O runner so publica o evento; quem provisiona sao as Lambdas.    #
+  # ------------------------------------------------------------------ #
+  provision:
+    name: Provision 💸 (${{ github.event.inputs.environment || 'dev' }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'provision'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}-provision
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Credenciais via OIDC (role sem permissao de criar recursos)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_AGENT_INVOKE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-agent-provision-${{ github.run_id }}
+
+      - name: Publica o evento e acompanha a execucao
+        id: provision
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          bash scripts/trigger.sh "${ENVIRONMENT}"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      # trigger.sh imprime o status mas nao falha o processo: o gate e aqui.
+      - name: Gate de status da execucao
+        id: gate
+        run: |
+          set -euo pipefail
+          sm=$(aws stepfunctions list-state-machines \
+            --query "stateMachines[?name=='${PROJECT_NAME}-provisioning'].stateMachineArn | [0]" \
+            --output text)
+          exec_arn=$(aws stepfunctions list-executions --state-machine-arn "${sm}" --max-items 1 \
+            --query 'executions[0].executionArn' --output text)
+          status=$(aws stepfunctions describe-execution --execution-arn "${exec_arn}" \
+            --query status --output text)
+          echo "status=${status}" >> "$GITHUB_OUTPUT"
+          echo "execution=${exec_arn}" >> "$GITHUB_OUTPUT"
+          [[ "${status}" == "SUCCEEDED" ]]
+
+      - name: Job summary
+        if: always()
+        run: |
+          {
+            echo "## Agente serverless — provision (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de provisionamento | ${{ steps.provision.outputs.seconds }}s |"
+            echo "| Status | ${{ steps.gate.outputs.status }} |"
+            echo ""
+            echo "Execucao: \`${{ steps.gate.outputs.execution }}\`"
+            echo ""
+            echo "Contrato: \`/${PROJECT_NAME}/${ENVIRONMENT}/base-infra-serverless\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  # 5. Destroy — dispatch + string de confirmacao + aprovacao.          #
+  #    Prod e bloqueado aqui e tambem no handler (exige break_glass,    #
+  #    que esta esteira nunca envia).                                   #
+  # ------------------------------------------------------------------ #
+  destroy:
+    name: Destroy (${{ github.event.inputs.environment }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}-destroy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Bloqueio de producao
+        if: github.event.inputs.environment == 'prod'
+        run: |
+          echo "::error::Destroy de producao e bloqueado por codigo nesta esteira."
+          exit 1
+
+      # A confirmacao vai por env, nunca interpolada direto no shell.
+      - name: Confirmacao textual
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [[ "${CONFIRM}" != "DESTROY-${ENVIRONMENT}" ]]; then
+            echo "::error::Confirmacao invalida. Esperado: DESTROY-${ENVIRONMENT}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: Credenciais via OIDC (role sem permissao de criar recursos)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_AGENT_INVOKE_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-agent-destroy-${{ github.run_id }}
+
+      - name: Dispara a state machine de decommission
+        id: destroy
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          bash scripts/destroy.sh "${ENVIRONMENT}" "DESTROY-${ENVIRONMENT}"
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Conferencia de residuos
+        if: always()
+        run: |
+          {
+            echo "## Agente serverless — destroy (${ENVIRONMENT})"
+            echo ""
+            echo "Tempo: ${{ steps.destroy.outputs.seconds }}s"
+            echo ""
+            echo "CMKs entram em exclusao agendada de 7 dias — continuam custando ~US\$ 1/mes no periodo."
+            echo ""
+            echo "A role de invocacao nao tem \`ec2:Describe*\` por design, entao a conferencia de"
+            echo "residuos (NAT, EIP, ENI orfa) e feita fora desta esteira — RUNBOOK etapa 6."
+          } >> "$GITHUB_STEP_SUMMARY"

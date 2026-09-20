@@ -1,0 +1,66 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tofu fmt*)",
+      "Bash(tofu validate*)",
+      "Bash(tofu plan*)",
+      "Bash(tofu show*)",
+      "Bash(tofu output*)",
+      "Bash(tflint*)",
+      "Bash(checkov*)",
+      "Bash(infracost*)",
+      "Bash(cdk synth*)",
+      "Bash(cdk diff*)",
+      "Bash(ruff*)",
+      "Bash(pytest*)",
+      "Bash(mypy*)",
+      "Bash(sam validate*)",
+      "Bash(sam build*)",
+      "Bash(cfn-lint*)",
+      "Bash(aws sts get-caller-identity*)",
+      "Bash(aws ssm get-parameter*)",
+      "Bash(aws stepfunctions describe-execution*)",
+      "Bash(aws stepfunctions list-executions*)",
+      "Bash(aws stepfunctions get-execution-history*)",
+      "Bash(aws dynamodb scan*)",
+      "Bash(aws ec2 describe-*)",
+      "Bash(aws cloudformation describe-stacks*)",
+      "Bash(git *)"
+    ],
+    "ask": [
+      "Bash(tofu apply*)",
+      "Bash(tofu destroy*)",
+      "Bash(cdk deploy*)",
+      "Bash(cdk destroy*)",
+      "Bash(sam deploy*)",
+      "Bash(sam delete*)",
+      "Bash(aws stepfunctions start-execution*)",
+      "Bash(aws events put-events*)",
+      "Bash(./scripts/trigger.sh*)",
+      "Bash(./scripts/destroy.sh*)"
+    ],
+    "deny": [
+      "Read(./**/*.tfstate)",
+      "Read(./**/.terraform/**)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Read(~/.aws/credentials)",
+      "Bash(rm -rf*)",
+      "Bash(aws iam create-user*)",
+      "Bash(aws iam create-access-key*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash .claude/hooks/guard-destructive.sh"
+          }
+        ]
+      }
+    ]
+  }
+}

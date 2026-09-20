@@ -1,0 +1,60 @@
+{
+  "Comment": "Destruicao controlada dos recursos registrados",
+  "StartAt": "ValidateConfirmation",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "ValidateConfirmation": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "And": [
+            { "Variable": "$.confirm", "IsPresent": true },
+            { "Variable": "$.environment", "IsPresent": true }
+          ],
+          "Next": "Destroy"
+        }
+      ],
+      "Default": "Rejected"
+    },
+
+    "Destroy": {
+      "Type": "Task",
+      "Resource": "${DestroyFunctionArn}",
+      "TimeoutSeconds": 900,
+      "Retry": [
+        {
+          "ErrorEquals": ["NotReadyError"],
+          "IntervalSeconds": 30,
+          "MaxAttempts": 10,
+          "BackoffRate": 1.5,
+          "Comment": "DependencyViolation por ENI orfa resolve-se com espera"
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "Remaining?"
+    },
+
+    "Remaining?": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.remaining", "NumericGreaterThan": 0, "Next": "WaitAndRetry" }],
+      "Default": "Done"
+    },
+
+    "WaitAndRetry": { "Type": "Wait", "Seconds": 60, "Next": "Destroy" },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "Agente DevOps serverless - falha na destruicao",
+        "Message.$": "States.JsonToString($)"
+      },
+      "Next": "Failed"
+    },
+
+    "Rejected": { "Type": "Fail", "Error": "ConfirmationMissing", "Cause": "Informe confirm=DESTROY-<env>" },
+    "Failed": { "Type": "Fail", "Error": "DecommissionFailed" },
+    "Done": { "Type": "Succeed" }
+  }
+}

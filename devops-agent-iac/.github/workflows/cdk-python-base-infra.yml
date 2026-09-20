@@ -1,0 +1,455 @@
+# Esteira da Abordagem 2 — AWS CDK (Python).
+#
+# Estagios: qualidade -> diff -> deploy (com aprovacao) -> destroy (dupla confirmacao).
+# Autenticacao exclusivamente por OIDC; nenhuma access key estatica no repositorio.
+#
+# Secrets esperados:
+#   AWS_CDK_PY_DEPLOY_ROLE_ARN  role de deploy (OIDC) com acesso as roles cdk-hnb659fds-*
+#
+# Environments esperados (configure required reviewers em cada um):
+#   dev, prod, dev-destroy, prod-destroy
+#
+# Nota: o job de qualidade roda sem credencial AWS. O `cdk synth` usa o account
+# placeholder do cdk.json — nao ha context lookup no codigo, entao o synth e o
+# cdk-nag funcionam offline. Os jobs que tocam a conta injetam o account real
+# vindo do STS.
+name: cdk-python-base-infra
+
+on:
+  pull_request:
+    paths:
+      - 'abordagem-2-cdk-python/**'
+      - '.github/workflows/cdk-python-base-infra.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'abordagem-2-cdk-python/**'
+      - '.github/workflows/cdk-python-base-infra.yml'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Ambiente alvo
+        type: choice
+        options: [dev, prod]
+        default: dev
+      action:
+        description: Acao a executar
+        type: choice
+        options: [diff, deploy, destroy]
+        default: diff
+      confirm:
+        description: 'Apenas para destroy: digite DESTROY-<ambiente>'
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cdk-python-base-infra-${{ github.event.inputs.environment || 'dev' }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  PYTHON_VERSION: '3.11'
+  NODE_VERSION: '20'
+  # Precisa ser identica a aws-cdk-lib do requirements.txt, senao:
+  # "Cloud assembly schema version mismatch" (RUNBOOK 4.1).
+  CDK_CLI_VERSION: 2.150.0
+  CHECKOV_VERSION: 3.2.200
+  ENVIRONMENT: ${{ github.event.inputs.environment || 'dev' }}
+  PROJECT_DIR: abordagem-2-cdk-python
+
+jobs:
+  # ------------------------------------------------------------------ #
+  # 1. Qualidade — ruff, mypy, pytest, synth (cdk-nag) e Checkov.       #
+  # ------------------------------------------------------------------ #
+  quality:
+    name: Qualidade (ruff, mypy, pytest, synth, Checkov)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instala dependencias
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          pip install --quiet -r requirements-dev.txt
+          npm install -g "aws-cdk@${CDK_CLI_VERSION}"
+
+      - name: ruff
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: ruff check .
+
+      # Nao bloqueante: pyproject.toml declara mypy strict, mas os construtores
+      # das stacks ainda usam **kwargs sem anotacao. Serve como relatorio ate a
+      # tipagem ser fechada.
+      - name: mypy (relatorio)
+        working-directory: ${{ env.PROJECT_DIR }}
+        continue-on-error: true
+        run: mypy app_lib app.py
+
+      - name: pytest
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: PYTHONPATH=. pytest -v
+
+      - name: cdk synth (executa cdk-nag)
+        id: synth
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cdk synth -c "env=${ENVIRONMENT}" --quiet
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      # A revisao de IAM desta abordagem recai sobre o template sintetizado, nao
+      # sobre o Python — por isso o Checkov roda em cdk.out.
+      - name: Checkov (template sintetizado)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          checkov -d cdk.out --framework cloudformation --compact \
+            --output cli --output sarif --output-file-path console,.
+
+      # Falha sem Advanced Security em repositorio privado — nao bloqueia a esteira.
+      - name: Publica SARIF do Checkov
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: ${{ env.PROJECT_DIR }}/results.sarif
+          category: checkov-cdk-python
+
+      - name: Policies IAM do template (auditoria)
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          {
+            echo "## CDK Python — synth (${ENVIRONMENT})"
+            echo ""
+            echo "Tempo de synth: ${{ steps.synth.outputs.seconds }}s"
+            echo ""
+            echo "<details><summary>Statements de IAM sintetizados</summary>"
+            echo ""
+            echo '```json'
+            jq -s '[.[].Resources | to_entries[]
+              | select(.value.Type == "AWS::IAM::Policy")
+              | .value.Properties.PolicyDocument.Statement] | flatten' \
+              cdk.out/*.template.json | head -c 40000
+            echo '```'
+            echo "</details>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  # 2. Diff — equivalente ao plan; comentado no PR junto da estimativa. #
+  # ------------------------------------------------------------------ #
+  diff:
+    name: Diff (${{ github.event.inputs.environment || 'dev' }})
+    needs: quality
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.action != 'destroy'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instala dependencias
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          pip install --quiet -r requirements-dev.txt
+          npm install -g "aws-cdk@${CDK_CLI_VERSION}"
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CDK_PY_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-cdk-diff-${{ github.run_id }}
+
+      # O cdk.json versionado traz placeholders (account 111111111111 e
+      # githubRepository ficticio). Aqui eles sao substituidos pelos valores
+      # reais da sessao — evita commitar o ID da conta no repositorio.
+      - name: Injeta account e repositorio no contexto
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          jq --arg env "${ENVIRONMENT}" --arg acc "${account}" --arg repo "${GITHUB_REPOSITORY}" \
+            '.context.environments[$env].account = $acc | .context.githubRepository = $repo' \
+            cdk.json > cdk.json.tmp && mv cdk.json.tmp cdk.json
+
+      - name: cdk diff
+        id: diff
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cdk diff -c "env=${ENVIRONMENT}" 2>&1 | tee cdk-diff.txt
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      # Infracost nao le CloudFormation. A estimativa abaixo conta os recursos
+      # caros no template sintetizado e aplica os precos de referencia do
+      # COMPARATIVO secao 3 (us-east-1).
+      - name: Estimativa de custo mensal
+        id: cost
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          count() { jq -s --arg t "$1" '[.[].Resources | to_entries[]
+            | select(.value.Type == $t)] | length' cdk.out/*.template.json; }
+          nat=$(count AWS::EC2::NatGateway)
+          cmk=$(count AWS::KMS::Key)
+          eps=$(jq -s '[.[].Resources | to_entries[]
+            | select(.value.Type == "AWS::EC2::VPCEndpoint")
+            | select(.value.Properties.VpcEndpointType == "Interface")] | length' cdk.out/*.template.json)
+          total=$(awk -v n="$nat" -v c="$cmk" -v e="$eps" 'BEGIN{printf "%.2f", n*32.85 + c*1.00 + e*7.30}')
+          {
+            echo "nat=${nat}"
+            echo "cmk=${cmk}"
+            echo "endpoints=${eps}"
+            echo "total=${total}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## CDK Python — diff (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de diff | ${{ steps.diff.outputs.seconds }}s |"
+            echo "| NAT Gateways | ${{ steps.cost.outputs.nat }} |"
+            echo "| CMKs | ${{ steps.cost.outputs.cmk }} |"
+            echo "| Interface endpoints | ${{ steps.cost.outputs.endpoints }} |"
+            echo "| Estimativa 💸 | ~US\$ ${{ steps.cost.outputs.total }}/mes |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comenta o diff no PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          DIFF_SECONDS: ${{ steps.diff.outputs.seconds }}
+          COST_TOTAL: ${{ steps.cost.outputs.total }}
+          COST_NAT: ${{ steps.cost.outputs.nat }}
+          COST_CMK: ${{ steps.cost.outputs.cmk }}
+          COST_EPS: ${{ steps.cost.outputs.endpoints }}
+        with:
+          script: |
+            const fs = require('fs');
+            let diff = '(diff indisponivel)';
+            try { diff = fs.readFileSync(`${process.env.PROJECT_DIR}/cdk-diff.txt`, 'utf8').slice(0, 55000); }
+            catch {}
+            const marker = '<!-- cdk-python-base-infra-diff -->';
+
+            let body = `${marker}\n### CDK Python — diff \`${process.env.ENVIRONMENT}\`\n\n`;
+            body += `| Metrica | Valor |\n|---|---|\n`;
+            body += `| Tempo de diff | ${process.env.DIFF_SECONDS}s |\n`;
+            body += `| NAT / CMK / interface endpoints | ${process.env.COST_NAT} / ${process.env.COST_CMK} / ${process.env.COST_EPS} |\n`;
+            body += `| Estimativa 💸 | ~US$ ${process.env.COST_TOTAL}/mes (precos de referencia do COMPARATIVO) |\n\n`;
+            body += `<details><summary>cdk diff completo</summary>\n\n\`\`\`\n${diff}\n\`\`\`\n</details>`;
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const existing = (await github.rest.issues.listComments({ owner, repo, issue_number }))
+              .data.find(c => c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+  # ------------------------------------------------------------------ #
+  # 3. Deploy 💸 — sob aprovacao do Environment.                        #
+  # ------------------------------------------------------------------ #
+  deploy:
+    name: Deploy 💸 (${{ github.event.inputs.environment || 'dev' }})
+    needs: diff
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'deploy')
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'dev' }}
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instala dependencias
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          pip install --quiet -r requirements-dev.txt
+          npm install -g "aws-cdk@${CDK_CLI_VERSION}"
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CDK_PY_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-cdk-deploy-${{ github.run_id }}
+
+      - name: Injeta account e repositorio no contexto
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          jq --arg env "${ENVIRONMENT}" --arg acc "${account}" --arg repo "${GITHUB_REPOSITORY}" \
+            '.context.environments[$env].account = $acc | .context.githubRepository = $repo' \
+            cdk.json > cdk.json.tmp && mv cdk.json.tmp cdk.json
+
+      - name: cdk deploy
+        id: deploy
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cdk deploy --all -c "env=${ENVIRONMENT}" \
+            --require-approval never \
+            --outputs-file cdk-outputs.json
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Verifica o contrato publicado
+        id: contract
+        run: |
+          set -euo pipefail
+          aws ssm get-parameter --name "/agentes-devops/${ENVIRONMENT}/base-infra-cdk-py" \
+            --query Parameter.Value --output text | jq . > contract.json
+          echo "keys=$(jq 'keys | length' contract.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Job summary
+        run: |
+          {
+            echo "## CDK Python — deploy (${ENVIRONMENT})"
+            echo ""
+            echo "| Metrica | Valor |"
+            echo "|---|---|"
+            echo "| Tempo de deploy | ${{ steps.deploy.outputs.seconds }}s |"
+            echo "| Chaves no contrato SSM | ${{ steps.contract.outputs.keys }} |"
+            echo ""
+            echo "Contrato: \`/agentes-devops/${ENVIRONMENT}/base-infra-cdk-py\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ------------------------------------------------------------------ #
+  # 4. Destroy — dispatch + string de confirmacao + aprovacao.          #
+  #    Prod e bloqueado por codigo; la buckets e CMKs sao RETAIN.       #
+  # ------------------------------------------------------------------ #
+  destroy:
+    name: Destroy (${{ github.event.inputs.environment }})
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}-destroy
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Bloqueio de producao
+        if: github.event.inputs.environment == 'prod'
+        run: |
+          echo "::error::Destroy de producao e bloqueado por codigo nesta esteira."
+          exit 1
+
+      # A confirmacao vai por env, nunca interpolada direto no shell.
+      - name: Confirmacao textual
+        env:
+          CONFIRM: ${{ github.event.inputs.confirm }}
+        run: |
+          if [[ "${CONFIRM}" != "DESTROY-${ENVIRONMENT}" ]]; then
+            echo "::error::Confirmacao invalida. Esperado: DESTROY-${ENVIRONMENT}"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: ${{ env.PROJECT_DIR }}/requirements-dev.txt
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Instala dependencias
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          pip install --quiet -r requirements-dev.txt
+          npm install -g "aws-cdk@${CDK_CLI_VERSION}"
+
+      - name: Credenciais via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_CDK_PY_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-cdk-destroy-${{ github.run_id }}
+
+      - name: Injeta account e repositorio no contexto
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          account=$(aws sts get-caller-identity --query Account --output text)
+          jq --arg env "${ENVIRONMENT}" --arg acc "${account}" --arg repo "${GITHUB_REPOSITORY}" \
+            '.context.environments[$env].account = $acc | .context.githubRepository = $repo' \
+            cdk.json > cdk.json.tmp && mv cdk.json.tmp cdk.json
+
+      - name: cdk destroy
+        id: destroy
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          cdk destroy --all -c "env=${ENVIRONMENT}" --force
+          echo "seconds=$(( $(date +%s) - start ))" >> "$GITHUB_OUTPUT"
+
+      - name: Conferencia de residuos
+        run: |
+          {
+            echo "## CDK Python — destroy (${ENVIRONMENT})"
+            echo ""
+            echo "Tempo: ${{ steps.destroy.outputs.seconds }}s"
+            echo ""
+            echo '### Stacks remanescentes'
+            echo '```'
+            aws cloudformation list-stacks \
+              --stack-status-filter CREATE_COMPLETE UPDATE_COMPLETE DELETE_FAILED \
+              --query 'StackSummaries[?contains(StackName, `BaseInfra`)].[StackName,StackStatus]' \
+              --output text
+            echo '```'
+            echo '### NAT Gateways ativos'
+            echo '```'
+            aws ec2 describe-nat-gateways \
+              --query 'NatGateways[?State==`available`].[NatGatewayId,VpcId]' --output text
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

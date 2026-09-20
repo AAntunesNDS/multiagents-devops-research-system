@@ -1,0 +1,33 @@
+{
+  "app": "python3 app.py",
+  "watch": { "include": ["**"], "exclude": ["README.md", "cdk*.json", ".venv", "tests"] },
+  "context": {
+    "@aws-cdk/aws-iam:minimizePolicies": true,
+    "@aws-cdk/core:checkSecretUsage": true,
+    "@aws-cdk/core:enablePartitionLiterals": true,
+    "@aws-cdk/aws-s3:serverAccessLogsUseBucketPolicy": true,
+    "@aws-cdk/core:target-partitions": ["aws"],
+    "projectName": "agentes-devops",
+    "githubRepository": "seu-usuario/agentes-devops-iac",
+    "environments": {
+      "dev": {
+        "account": "111111111111",
+        "region": "us-east-1",
+        "vpc_cidr": "10.22.0.0/16",
+        "max_azs": 2,
+        "nat_gateways": 1,
+        "enable_interface_endpoints": false,
+        "log_retention_days": 14
+      },
+      "prod": {
+        "account": "222222222222",
+        "region": "us-east-1",
+        "vpc_cidr": "10.32.0.0/16",
+        "max_azs": 3,
+        "nat_gateways": 3,
+        "enable_interface_endpoints": true,
+        "log_retention_days": 90
+      }
+    }
+  }
+}

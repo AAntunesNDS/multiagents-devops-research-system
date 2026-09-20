@@ -1,0 +1,31 @@
+# Claude Code - pessoal
+.claude/settings.local.json
+CLAUDE.local.md
+
+# Secrets / credenciais
+.env
+.env.*
+*.tfstate
+*.tfstate.backup
+terraform.tfvars
+
+# Venvs / dependências
+.venv/
+venv/
+node_modules/
+__pycache__/
+
+# Build / output
+dist/
+build/
+cdk.out/
+.cdk.staging/
+
+# Terraform local
+.terraform/
+.terraform.lock.hcl
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

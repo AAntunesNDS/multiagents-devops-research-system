@@ -1,0 +1,161 @@
+{
+  "Comment": "Agente DevOps serverless - fluxo de provisionamento da camada base",
+  "StartAt": "Plan",
+  "TimeoutSeconds": 3600,
+  "States": {
+    "Plan": {
+      "Type": "Task",
+      "Resource": "${PlannerFunctionArn}",
+      "ResultPath": "$",
+      "Retry": [
+        {
+          "ErrorEquals": ["RetryableError", "States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "NotifyFailure" }],
+      "Next": "IsDryRun"
+    },
+
+    "IsDryRun": {
+      "Type": "Choice",
+      "Choices": [{ "Variable": "$.dry_run", "BooleanEquals": true, "Next": "PlanOnly" }],
+      "Default": "Encryption"
+    },
+
+    "PlanOnly": {
+      "Type": "Succeed",
+      "Comment": "Equivalente ao tofu plan: calcula acoes e encerra sem tocar na AWS"
+    },
+
+    "Encryption": {
+      "Type": "Task",
+      "Resource": "${EncryptionFunctionArn}",
+      "Retry": [
+        { "ErrorEquals": ["RetryableError"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rollback" }],
+      "Next": "Network"
+    },
+
+    "Network": {
+      "Type": "Task",
+      "Resource": "${NetworkFunctionArn}",
+      "TimeoutSeconds": 600,
+      "Retry": [
+        { "ErrorEquals": ["RetryableError"], "IntervalSeconds": 10, "MaxAttempts": 3, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rollback" }],
+      "Next": "WaitForNat"
+    },
+
+    "WaitForNat": {
+      "Type": "Wait",
+      "Seconds": 30,
+      "Comment": "NAT Gateway leva 2-5 min; o polling evita segurar a Lambda ociosa",
+      "Next": "CheckNat"
+    },
+
+    "CheckNat": {
+      "Type": "Task",
+      "Resource": "${NatPollerFunctionArn}",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 3 }],
+      "Next": "NatReady?"
+    },
+
+    "NatReady?": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.nat_status", "StringEquals": "AVAILABLE", "Next": "Routing" },
+        { "Variable": "$.nat_status", "StringEquals": "FAILED", "Next": "Rollback" }
+      ],
+      "Default": "WaitForNat"
+    },
+
+    "Routing": {
+      "Type": "Task",
+      "Resource": "${RoutingFunctionArn}",
+      "Retry": [
+        { "ErrorEquals": ["RetryableError"], "IntervalSeconds": 5, "MaxAttempts": 4, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rollback" }],
+      "Next": "ParallelPolicies"
+    },
+
+    "ParallelPolicies": {
+      "Type": "Parallel",
+      "Comment": "SGs e roles nao dependem entre si; execucao concorrente reduz o tempo total",
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rollback" }],
+      "Branches": [
+        {
+          "StartAt": "SecurityGroups",
+          "States": {
+            "SecurityGroups": {
+              "Type": "Task",
+              "Resource": "${SecurityGroupsFunctionArn}",
+              "Retry": [
+                { "ErrorEquals": ["RetryableError"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+              ],
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "Identity",
+          "States": {
+            "Identity": {
+              "Type": "Task",
+              "Resource": "${IdentityFunctionArn}",
+              "Retry": [
+                { "ErrorEquals": ["RetryableError"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+              ],
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultSelector": {
+        "environment.$": "$[0].environment",
+        "execution_id.$": "$[0].execution_id",
+        "spec.$": "$[0].spec",
+        "outputs.$": "States.JsonMerge($[0].outputs, $[1].outputs, false)"
+      },
+      "Next": "PublishContract"
+    },
+
+    "PublishContract": {
+      "Type": "Task",
+      "Resource": "${ContractFunctionArn}",
+      "Retry": [
+        { "ErrorEquals": ["States.ALL"], "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2 }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Rollback" }],
+      "Next": "Success"
+    },
+
+    "Rollback": {
+      "Type": "Task",
+      "Resource": "${RollbackFunctionArn}",
+      "Comment": "Compensacao: nao existe rollback transacional como no CloudFormation",
+      "Retry": [{ "ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 2 }],
+      "Next": "NotifyFailure"
+    },
+
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertTopicArn}",
+        "Subject": "Agente DevOps serverless - falha no provisionamento",
+        "Message.$": "States.JsonToString($)"
+      },
+      "Next": "Fail"
+    },
+
+    "Fail": { "Type": "Fail", "Error": "ProvisioningFailed" },
+
+    "Success": { "Type": "Succeed" }
+  }
+}

@@ -1,0 +1,2 @@
+# boto3 e botocore ja vem no runtime da Lambda; fixar versao so se precisar de
+# API nova. Manter a layer vazia reduz cold start e superficie de supply chain.

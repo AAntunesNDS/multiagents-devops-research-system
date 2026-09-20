@@ -1,0 +1,17 @@
+version = 0.1
+
+[dev.deploy.parameters]
+stack_name = "agentes-devops-serverless-agent-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+parameter_overrides = "ProjectName=agentes-devops EnvironmentName=dev AlertEmail=SEU-EMAIL@dominio.com"
+confirm_changeset = false
+
+[prod.deploy.parameters]
+stack_name = "agentes-devops-serverless-agent-prod"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM CAPABILITY_NAMED_IAM"
+resolve_s3 = true
+parameter_overrides = "ProjectName=agentes-devops EnvironmentName=prod AlertEmail=SEU-EMAIL@dominio.com"
+confirm_changeset = true
