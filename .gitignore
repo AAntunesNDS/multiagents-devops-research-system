@@ -8,6 +8,17 @@ CLAUDE.local.md
 *.tfstate
 *.tfstate.backup
 terraform.tfvars
+*.tfvars
+*.tfvars.json
+
+# Local artifacts / plans
+tfplan
+*.tfplan
+*.tfplan.json
+tfplan.json
+samconfig.toml
+github-copilot.md
+/tmp/*.json
 
 # Venvs / dependências
 .venv/

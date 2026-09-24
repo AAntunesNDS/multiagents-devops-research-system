@@ -36,6 +36,24 @@ aqui — se este arquivo e o RUNBOOK divergirem, o RUNBOOK vence.
   interface é 💸. Avise antes de propor a execução, mesmo que o usuário já
   tenha confirmado a etapa maior.
 
+## Segurança e verificação de credenciais
+
+- Nunca imprimir, colar, exportar inline ou gravar credenciais AWS; use
+  apenas o perfil configurado com `aws configure` / SSO. Antes de rodar
+  comandos AWS, confirme a identidade com `aws sts get-caller-identity`.
+- Nunca alterar policies, roles, usuários ou chaves IAM da identidade que
+  executa os comandos, e nunca anexar policies gerenciadas `*FullAccess` /
+  `AdministratorAccess` sem autorização explícita. Se faltar permissão,
+  parar e pedir o JSON mínimo do recurso e da ação exatos.
+- Nunca declarar sucesso de `apply`/`destroy` sem checar o exit code e rodar
+  `tofu plan` (esperado: `No changes.`) após a operação.
+- Após qualquer comando que possa gerar log com segredo, não gravar saída em
+  `/tmp` sem redigir o conteúdo antes. Logs e artefatos de diagnóstico devem
+  ser tratados como sensíveis.
+- Se houver incidente de exposição de credenciais, registrar a ocorrência sem
+  incluir valor de chave e, quando aplicável, rotacionar a credencial sem
+  divulgar o material secreto.
+
 ## Convenções
 
 - Comentários e documentação em português; nomes de recursos/variáveis em inglês.

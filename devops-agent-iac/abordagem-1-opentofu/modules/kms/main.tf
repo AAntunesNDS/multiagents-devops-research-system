@@ -5,6 +5,13 @@
 data "aws_caller_identity" "current" {}
 data "aws_partition" "current" {}
 
+locals {
+  key_admin_principals = [
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root",
+    "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:user/DevopsAgent"
+  ]
+}
+
 data "aws_iam_policy_document" "key" {
   for_each = var.keys
 
@@ -15,7 +22,12 @@ data "aws_iam_policy_document" "key" {
     resources = ["*"]
     principals {
       type        = "AWS"
-      identifiers = ["arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:root"]
+      identifiers = local.key_admin_principals
+    }
+    condition {
+      test     = "StringEquals"
+      variable = "kms:CallerAccount"
+      values   = [data.aws_caller_identity.current.account_id]
     }
   }
 
